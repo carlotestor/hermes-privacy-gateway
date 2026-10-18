@@ -49,6 +49,9 @@ def _get_engine(ctx):
                 langextract_config_path=str(
                     _config(ctx, "langextract_config_path", "")
                 ),
+                sanitize_cache_chars=int(
+                    _config(ctx, "sanitize_cache_chars", 16_000_000)
+                ),
             )
         except Exception as exc:
             _ENGINE_ERROR = exc

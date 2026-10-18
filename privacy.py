@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
+import sys
+import threading
+import types
+from collections import OrderedDict
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Sequence
 
@@ -173,6 +178,129 @@ def select_non_overlapping_results(
     return sorted(selected, key=lambda item: (int(item.start), int(item.end)))
 
 
+DEFAULT_SANITIZE_CACHE_CHARS = 16_000_000
+
+# Held in sys.modules so every loaded copy of this plugin (one per Hermes
+# profile in a multi-profile gateway) shares one analyzer and one NLP lock.
+_SHARED_STATE_NAME = "_hermes_privacy_gateway_shared"
+
+
+def _shared_state() -> Any:
+    state = sys.modules.get(_SHARED_STATE_NAME)
+    if state is None:
+        fresh: Any = types.ModuleType(_SHARED_STATE_NAME)
+        fresh.lock = threading.Lock()
+        fresh.analyzers = {}
+        state = sys.modules.setdefault(_SHARED_STATE_NAME, fresh)
+    return state
+
+
+class _SanitizeCache:
+    """Bounded LRU of sanitize() results keyed by a digest of the input text."""
+
+    def __init__(self, max_chars: int) -> None:
+        self.max_chars = max(0, int(max_chars))
+        self._items: OrderedDict[bytes, str] = OrderedDict()
+        self._chars = 0
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def key(text: str) -> bytes:
+        return hashlib.blake2b(
+            text.encode("utf-8", "surrogatepass"), digest_size=16
+        ).digest()
+
+    def get(self, key: bytes) -> str | None:
+        with self._lock:
+            value = self._items.get(key)
+            if value is not None:
+                self._items.move_to_end(key)
+            return value
+
+    def put(self, key: bytes, value: str) -> None:
+        cost = len(value)
+        if cost > self.max_chars:
+            return
+        with self._lock:
+            if key in self._items:
+                return
+            self._items[key] = value
+            self._chars += cost
+            while self._chars > self.max_chars:
+                _, evicted = self._items.popitem(last=False)
+                self._chars -= len(evicted)
+
+
+def _build_analyzer(
+    nlp_config_path: Path,
+    language: str,
+    enable_langextract: bool,
+    langextract_config_path: str,
+):
+    from presidio_analyzer import AnalyzerEngine
+    from presidio_analyzer.nlp_engine import NlpEngineProvider
+
+    provider = NlpEngineProvider(conf_file=str(nlp_config_path))
+    # Presidio's spaCy engine silently runs `spacy.cli.download` (an
+    # unpinned pip install into the Hermes runtime) for a missing model.
+    # Refuse instead; the model is a documented manual install.
+    if provider.nlp_configuration.get("nlp_engine_name") == "spacy":
+        import spacy.util
+
+        for model in provider.nlp_configuration.get("models") or []:
+            name = str(model.get("model_name", ""))
+            if not (spacy.util.is_package(name) or Path(name).exists()):
+                raise RuntimeError(
+                    f"spaCy model {name!r} is not installed; install it as "
+                    "described in docs/INSTALL.md (the plugin will not "
+                    "download it at runtime)"
+                )
+    nlp_engine = provider.create_engine()
+    analyzer = AnalyzerEngine(
+        nlp_engine=nlp_engine,
+        supported_languages=[language],
+    )
+
+    if enable_langextract:
+        from presidio_analyzer.predefined_recognizers.third_party.basic_langextract_recognizer import (
+            BasicLangExtractRecognizer,
+        )
+
+        if langextract_config_path:
+            recognizer = BasicLangExtractRecognizer(
+                config_path=langextract_config_path
+            )
+        else:
+            recognizer = BasicLangExtractRecognizer()
+        analyzer.registry.add_recognizer(recognizer)
+    return analyzer
+
+
+def _shared_analyzer(
+    nlp_config_path: Path,
+    language: str,
+    enable_langextract: bool,
+    langextract_config_path: str,
+):
+    """Return (analyzer, analysis_lock), building the analyzer once per process."""
+    digest = hashlib.sha256()
+    for path in (Path(__file__), Path(nlp_config_path)):
+        digest.update(path.read_bytes() if path.exists() else b"-")
+        digest.update(b"\0")
+    key = (digest.hexdigest(), language, bool(enable_langextract), langextract_config_path)
+
+    state = _shared_state()
+    with state.lock:
+        entry = state.analyzers.get(key)
+        if entry is None:
+            analyzer = _build_analyzer(
+                nlp_config_path, language, enable_langextract, langextract_config_path
+            )
+            entry = (analyzer, threading.Lock())
+            state.analyzers[key] = entry
+    return entry
+
+
 class PrivacyEngine:
     """Local detector + stable pseudonymizer."""
 
@@ -185,47 +313,18 @@ class PrivacyEngine:
         enable_langextract: bool = False,
         langextract_config_path: str = "",
         vault: AliasVault | None = None,
+        sanitize_cache_chars: int = DEFAULT_SANITIZE_CACHE_CHARS,
     ) -> None:
         self.language = language
         self.score_threshold = score_threshold
         self.vault = vault or AliasVault()
-
-        from presidio_analyzer import AnalyzerEngine
-        from presidio_analyzer.nlp_engine import NlpEngineProvider
-
-        provider = NlpEngineProvider(conf_file=str(nlp_config_path))
-        # Presidio's spaCy engine silently runs `spacy.cli.download` (an
-        # unpinned pip install into the Hermes runtime) for a missing model.
-        # Refuse instead; the model is a documented manual install.
-        if provider.nlp_configuration.get("nlp_engine_name") == "spacy":
-            import spacy.util
-
-            for model in provider.nlp_configuration.get("models") or []:
-                name = str(model.get("model_name", ""))
-                if not (spacy.util.is_package(name) or Path(name).exists()):
-                    raise RuntimeError(
-                        f"spaCy model {name!r} is not installed; install it as "
-                        "described in docs/INSTALL.md (the plugin will not "
-                        "download it at runtime)"
-                    )
-        nlp_engine = provider.create_engine()
-        self.analyzer = AnalyzerEngine(
-            nlp_engine=nlp_engine,
-            supported_languages=[language],
+        # Aliases depend on the vault key, so the cache is per engine.
+        self._cache = _SanitizeCache(sanitize_cache_chars)
+        # spaCy pipelines are not thread-safe and each concurrent forward pass
+        # allocates its own activations; analyze one text at a time.
+        self.analyzer, self._analysis_lock = _shared_analyzer(
+            nlp_config_path, language, enable_langextract, langextract_config_path
         )
-
-        if enable_langextract:
-            from presidio_analyzer.predefined_recognizers.third_party.basic_langextract_recognizer import (
-                BasicLangExtractRecognizer,
-            )
-
-            if langextract_config_path:
-                recognizer = BasicLangExtractRecognizer(
-                    config_path=langextract_config_path
-                )
-            else:
-                recognizer = BasicLangExtractRecognizer()
-            self.analyzer.registry.add_recognizer(recognizer)
 
     @staticmethod
     def remove_high_confidence_secrets(text: str) -> str:
@@ -237,13 +336,24 @@ class PrivacyEngine:
         if not text:
             return text
 
+        # Conversation history is re-sent on every request; reuse prior results.
+        cache_key = self._cache.key(text)
+        cached = self._cache.get(cache_key)
+        if cached is not None:
+            return cached
+        sanitized = self._sanitize_uncached(text)
+        self._cache.put(cache_key, sanitized)
+        return sanitized
+
+    def _sanitize_uncached(self, text: str) -> str:
         text = self.remove_high_confidence_secrets(text)
         protected = alias_ranges(text)
-        results = self.analyzer.analyze(
-            text=text,
-            language=self.language,
-            score_threshold=self.score_threshold,
-        )
+        with self._analysis_lock:
+            results = self.analyzer.analyze(
+                text=text,
+                language=self.language,
+                score_threshold=self.score_threshold,
+            )
 
         # Do not feed already-issued aliases back through Presidio.
         if protected:

@@ -2,6 +2,8 @@ from types import SimpleNamespace
 import base64
 import secrets
 import sqlite3
+import threading
+from pathlib import Path
 
 import pytest
 
@@ -10,6 +12,7 @@ pytest.importorskip("presidio_analyzer")
 from privacy import (
     BLOCKED_REQUEST,
     PrivacyEngine,
+    _SanitizeCache,
     blocked_content_for_key,
     contains_non_text_model_content,
     select_non_overlapping_results,
@@ -124,6 +127,8 @@ def test_sanitize_preserves_offsets_and_existing_aliases():
     engine.language = "en"
     engine.score_threshold = 0.55
     engine.vault = vault
+    engine._cache = _SanitizeCache(1_000)
+    engine._analysis_lock = threading.Lock()
 
     class FakeAnalyzer:
         def analyze(self, *, text, language, score_threshold):
@@ -168,3 +173,81 @@ def test_missing_spacy_model_is_refused_not_downloaded(monkeypatch):
 
     with pytest.raises(RuntimeError, match="en_core_web_lg"):
         PrivacyEngine(Path(__file__).resolve().parent.parent / "nlp.yaml", vault=vault)
+
+
+def _engine_with(analyzer, *, cache_chars=10_000):
+    key = base64.urlsafe_b64encode(secrets.token_bytes(32)).decode()
+    engine = object.__new__(PrivacyEngine)
+    engine.language = "en"
+    engine.score_threshold = 0.55
+    engine.vault = AliasVault(connection=sqlite3.connect(":memory:", check_same_thread=False), encoded_key=key)
+    engine._cache = _SanitizeCache(cache_chars)
+    engine._analysis_lock = threading.Lock()
+    engine.analyzer = analyzer
+    return engine
+
+
+def test_repeated_text_is_analyzed_once():
+    calls = []
+
+    class CountingAnalyzer:
+        def analyze(self, *, text, language, score_threshold):
+            calls.append(text)
+            start = text.index("alice@example.com")
+            return [SimpleNamespace(start=start, end=start + 17, score=0.9, entity_type="EMAIL_ADDRESS")]
+
+    engine = _engine_with(CountingAnalyzer())
+    first = engine.sanitize("mail alice@example.com now")
+    second = engine.sanitize("mail alice@example.com now")
+    assert first == second
+    assert "alice@example.com" not in first
+    assert len(calls) == 1
+
+
+def test_sanitize_cache_is_bounded():
+    cache = _SanitizeCache(10)
+    for i in range(5):
+        cache.put(cache.key(str(i)), "abcd")
+    assert cache._chars <= 10
+    assert cache.get(cache.key("0")) is None
+    assert cache.get(cache.key("4")) == "abcd"
+    cache.put(cache.key("big"), "x" * 11)
+    assert cache.get(cache.key("big")) is None
+
+
+def test_analysis_is_serialized_across_threads():
+    state = {"active": 0, "peak": 0}
+    guard = threading.Lock()
+    gate = threading.Event()
+
+    class SlowAnalyzer:
+        def analyze(self, *, text, language, score_threshold):
+            with guard:
+                state["active"] += 1
+                state["peak"] = max(state["peak"], state["active"])
+            gate.wait(0.05)
+            with guard:
+                state["active"] -= 1
+            return []
+
+    engine = _engine_with(SlowAnalyzer())
+    threads = [threading.Thread(target=engine.sanitize, args=(f"text {i}",)) for i in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(5)
+    assert state["peak"] == 1
+
+
+def test_engines_share_one_analyzer(monkeypatch):
+    import privacy
+
+    built = []
+    monkeypatch.setitem(privacy.sys.modules, privacy._SHARED_STATE_NAME, None)
+    privacy.sys.modules.pop(privacy._SHARED_STATE_NAME)
+    monkeypatch.setattr(privacy, "_build_analyzer", lambda *a: built.append(a) or object())
+    config = Path(__file__).resolve().parent.parent / "nlp.yaml"
+    a = privacy._shared_analyzer(config, "en", False, "")
+    b = privacy._shared_analyzer(config, "en", False, "")
+    assert a is b
+    assert len(built) == 1

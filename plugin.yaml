@@ -37,6 +37,10 @@ config_schema:
     type: str
     default: ""
     description: Optional Presidio LangExtract configuration path. Empty uses Presidio defaults.
+  sanitize_cache_chars:
+    type: int
+    default: 16000000
+    description: Character budget for the in-memory cache of already-sanitized text (history is re-sent every request). 0 disables.
   block_non_text_content:
     type: bool
     default: true
