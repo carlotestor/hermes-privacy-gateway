@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Skip re-analyzing text the plugin already sanitized: sanitized tool results
+  come back verbatim in later request history and are now cache hits.
 - Declare Hermes `>=0.20.4`, the first release providing the plugin storage API
   used by the encrypted alias vault.
 - Register the middleware even when `presidio-analyzer` is not installed: a

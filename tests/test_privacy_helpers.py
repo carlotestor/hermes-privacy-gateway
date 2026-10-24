@@ -251,3 +251,21 @@ def test_engines_share_one_analyzer(monkeypatch):
     b = privacy._shared_analyzer(config, "en", False, "")
     assert a is b
     assert len(built) == 1
+
+
+def test_sanitized_output_is_not_reanalyzed():
+    calls = []
+
+    class CountingAnalyzer:
+        def analyze(self, *, text, language, score_threshold):
+            calls.append(text)
+            if "alice@example.com" not in text:
+                return []
+            start = text.index("alice@example.com")
+            return [SimpleNamespace(start=start, end=start + 17, score=0.9, entity_type="EMAIL_ADDRESS")]
+
+    engine = _engine_with(CountingAnalyzer())
+    sanitized = engine.sanitize("mail alice@example.com now")
+    # A sanitized tool result is re-sent verbatim inside later request history.
+    assert engine.sanitize(sanitized) == sanitized
+    assert len(calls) == 1

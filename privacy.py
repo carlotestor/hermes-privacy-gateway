@@ -343,6 +343,9 @@ class PrivacyEngine:
             return cached
         sanitized = self._sanitize_uncached(text)
         self._cache.put(cache_key, sanitized)
+        if sanitized != text:
+            # Sanitized tool results come back verbatim in later history; they are already final.
+            self._cache.put(self._cache.key(sanitized), sanitized)
         return sanitized
 
     def _sanitize_uncached(self, text: str) -> str:
