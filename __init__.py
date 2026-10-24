@@ -49,6 +49,7 @@ def _get_engine(ctx):
                 langextract_config_path=str(
                     _config(ctx, "langextract_config_path", "")
                 ),
+                nlp_engine=str(_config(ctx, "nlp_engine", "spacy")),
                 sanitize_cache_chars=int(
                     _config(ctx, "sanitize_cache_chars", 16_000_000)
                 ),

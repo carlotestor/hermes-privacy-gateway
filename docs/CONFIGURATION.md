@@ -32,6 +32,12 @@ Default: `en`
 
 Passed to Presidio Analyzer. The included `nlp.yaml` only configures an English spaCy model. Adding another language requires updating both the NLP configuration and Presidio recognizer support; do not merely change this string and assume multilingual detection exists.
 
+### `nlp_engine`
+
+Default: `spacy`
+
+`spacy` loads the model from `nlp.yaml` and detects named entities (`PERSON`, `LOCATION`, `NRP`, ...) plus Presidio's pattern recognizers. `none` uses Presidio's `NoOpNlpEngine`: no model is loaded and only pattern/checksum recognizers run (email, phone, credit card, IBAN, IP, URL, crypto, US identifiers, ...). It is much faster and saves the model's memory, but names, locations and groups are no longer pseudonymized, and context words in the text no longer boost scores.
+
 ### `score_threshold`
 
 Default: `0.55`

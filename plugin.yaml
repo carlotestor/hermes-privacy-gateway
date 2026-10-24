@@ -37,6 +37,10 @@ config_schema:
     type: str
     default: ""
     description: Optional Presidio LangExtract configuration path. Empty uses Presidio defaults.
+  nlp_engine:
+    type: str
+    default: spacy
+    description: "spacy (NER + patterns) or none (pattern/checksum recognizers only: much faster, but names, locations and NRP are not detected)."
   sanitize_cache_chars:
     type: int
     default: 16000000

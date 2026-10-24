@@ -269,3 +269,31 @@ def test_sanitized_output_is_not_reanalyzed():
     # A sanitized tool result is re-sent verbatim inside later request history.
     assert engine.sanitize(sanitized) == sanitized
     assert len(calls) == 1
+
+
+def test_regex_only_engine_loads_no_spacy_model(monkeypatch):
+    import spacy
+
+    def no_load(*args, **kwargs):
+        raise AssertionError("spaCy model loaded in nlp_engine=none mode")
+
+    monkeypatch.setattr(spacy, "load", no_load)
+    key = base64.urlsafe_b64encode(secrets.token_bytes(32)).decode()
+    vault = AliasVault(connection=sqlite3.connect(":memory:"), encoded_key=key)
+    engine = PrivacyEngine(
+        Path(__file__).resolve().parent.parent / "nlp.yaml",
+        vault=vault,
+        nlp_engine="none",
+        sanitize_cache_chars=0,
+    )
+
+    sanitized = engine.sanitize("Mail alice@example.com about it")
+    assert "alice@example.com" not in sanitized
+    assert engine.rehydrate(sanitized) == "Mail alice@example.com about it"
+
+
+def test_unknown_nlp_engine_is_rejected():
+    key = base64.urlsafe_b64encode(secrets.token_bytes(32)).decode()
+    vault = AliasVault(connection=sqlite3.connect(":memory:"), encoded_key=key)
+    with pytest.raises(ValueError, match="nlp_engine"):
+        PrivacyEngine(Path("nlp.yaml"), vault=vault, nlp_engine="stanza")

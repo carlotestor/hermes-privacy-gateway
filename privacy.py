@@ -231,14 +231,30 @@ class _SanitizeCache:
                 self._chars -= len(evicted)
 
 
+NLP_ENGINES = ("spacy", "none")
+
+
 def _build_analyzer(
     nlp_config_path: Path,
     language: str,
     enable_langextract: bool,
     langextract_config_path: str,
+    nlp_engine_name: str = "spacy",
 ):
     from presidio_analyzer import AnalyzerEngine
     from presidio_analyzer.nlp_engine import NlpEngineProvider
+
+    if nlp_engine_name == "none":
+        # Pattern/checksum recognizers only: no model load, no NER entities.
+        from presidio_analyzer.nlp_engine import NoOpNlpEngine
+
+        nlp_engine = NoOpNlpEngine(models=[{"lang_code": language, "model_name": "none"}])
+        nlp_engine.load()
+        return _finish_analyzer(
+            AnalyzerEngine(nlp_engine=nlp_engine, supported_languages=[language]),
+            enable_langextract,
+            langextract_config_path,
+        )
 
     provider = NlpEngineProvider(conf_file=str(nlp_config_path))
     # Presidio's spaCy engine silently runs `spacy.cli.download` (an
@@ -260,7 +276,10 @@ def _build_analyzer(
         nlp_engine=nlp_engine,
         supported_languages=[language],
     )
+    return _finish_analyzer(analyzer, enable_langextract, langextract_config_path)
 
+
+def _finish_analyzer(analyzer, enable_langextract: bool, langextract_config_path: str):
     if enable_langextract:
         from presidio_analyzer.predefined_recognizers.third_party.basic_langextract_recognizer import (
             BasicLangExtractRecognizer,
@@ -281,20 +300,31 @@ def _shared_analyzer(
     language: str,
     enable_langextract: bool,
     langextract_config_path: str,
+    nlp_engine_name: str = "spacy",
 ):
     """Return (analyzer, analysis_lock), building the analyzer once per process."""
     digest = hashlib.sha256()
     for path in (Path(__file__), Path(nlp_config_path)):
         digest.update(path.read_bytes() if path.exists() else b"-")
         digest.update(b"\0")
-    key = (digest.hexdigest(), language, bool(enable_langextract), langextract_config_path)
+    key = (
+        digest.hexdigest(),
+        language,
+        bool(enable_langextract),
+        langextract_config_path,
+        nlp_engine_name,
+    )
 
     state = _shared_state()
     with state.lock:
         entry = state.analyzers.get(key)
         if entry is None:
             analyzer = _build_analyzer(
-                nlp_config_path, language, enable_langextract, langextract_config_path
+                nlp_config_path,
+                language,
+                enable_langextract,
+                langextract_config_path,
+                nlp_engine_name,
             )
             entry = (analyzer, threading.Lock())
             state.analyzers[key] = entry
@@ -314,7 +344,11 @@ class PrivacyEngine:
         langextract_config_path: str = "",
         vault: AliasVault | None = None,
         sanitize_cache_chars: int = DEFAULT_SANITIZE_CACHE_CHARS,
+        nlp_engine: str = "spacy",
     ) -> None:
+        nlp_engine = str(nlp_engine or "spacy").strip().lower()
+        if nlp_engine not in NLP_ENGINES:
+            raise ValueError(f"nlp_engine must be one of {NLP_ENGINES}, got {nlp_engine!r}")
         self.language = language
         self.score_threshold = score_threshold
         self.vault = vault or AliasVault()
@@ -323,7 +357,11 @@ class PrivacyEngine:
         # spaCy pipelines are not thread-safe and each concurrent forward pass
         # allocates its own activations; analyze one text at a time.
         self.analyzer, self._analysis_lock = _shared_analyzer(
-            nlp_config_path, language, enable_langextract, langextract_config_path
+            nlp_config_path,
+            language,
+            enable_langextract,
+            langextract_config_path,
+            nlp_engine,
         )
 
     @staticmethod
